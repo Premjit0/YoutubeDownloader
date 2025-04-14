@@ -1,0 +1,53 @@
+import sys
+from yt_dlp import YoutubeDL
+
+def progress_hook(d):
+    """
+    Prints the current download percentage and speed.
+    """
+    if d['status'] == 'downloading':
+        downloaded = d.get("downloaded_bytes", 0) or 0
+        total_bytes = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+        speed = d.get("speed") or 0  # Use fallback to 0 if speed is None
+        if total_bytes:
+            percent = downloaded / total_bytes * 100
+            speed_kb = speed / 1024 if speed > 0 else 0
+            sys.stdout.write(f"\rDownloading: {percent:.2f}% at {speed_kb:.2f} KB/s")
+            sys.stdout.flush()
+    elif d['status'] == 'finished':
+        sys.stdout.write("\nDownload completed.\n")
+
+def download_playlist(playlist_url):
+    """
+    Downloads all videos in the playlist using a format that includes both video and audio.
+    This avoids the need for ffmpeg to merge separate streams.
+    """
+    ydl_opts = {
+        # Use a format that already contains both video and audio.
+        # "best[height<=1080]" returns the best available stream up to 1080p,
+        # but combined streams may not always match the quality of merged separate streams.
+        'format': 'best[height<=1080]',
+        'progress_hooks': [progress_hook],
+        'outtmpl': '%(title)s.%(ext)s',
+        'noplaylist': False,  # Enable playlist processing; change to True to download just one video.
+    }
+
+    with YoutubeDL(ydl_opts) as ydl:
+        try:
+            print("Extracting playlist information...")
+            ydl.download([playlist_url])
+        except Exception as e:
+            print(f"An error occurred: {e}")
+
+def main():
+    playlist_url = input("Enter the YouTube playlist URL: ").strip()
+    if not playlist_url:
+        print("A valid YouTube playlist URL is required.")
+        return
+
+    print("Starting the download process...\n")
+    download_playlist(playlist_url)
+    print("All downloads finished.")
+
+if __name__ == '__main__':
+    main()
