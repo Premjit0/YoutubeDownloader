@@ -1,0 +1,423 @@
+import sys
+import time
+import os
+import urllib.parse
+from yt_dlp import YoutubeDL
+from fpdf import FPDF
+from docx import Document
+import keyboard  # pip install keyboard
+import tkinter as tk
+from tkinter import filedialog
+
+# Global pause flag
+PAUSE_FLAG = False
+
+
+def format_time(seconds):
+    """Converts seconds to a string in sec, mm:ss, or hh:mm:ss format."""
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds} sec"
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}:{sec:02d}"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}:{minutes:02d}:{sec:02d}"
+
+
+def fix_playlist_url(url):
+    """
+    If the provided URL contains a "list=" parameter but isn’t in the recommended format,
+    rebuild it as: https://www.youtube.com/playlist?list=PLAYLIST_ID
+    """
+    parsed = urllib.parse.urlparse(url)
+    query = urllib.parse.parse_qs(parsed.query)
+    if "list" in query:
+        playlist_id = query["list"][0]
+        if not parsed.path.startswith("/playlist"):
+            fixed_url = f"https://www.youtube.com/playlist?list={playlist_id}"
+            print(f"Fixed playlist URL: {fixed_url}")
+            return fixed_url
+    return url
+
+
+def on_pause_hotkey():
+    """
+    Hotkey callback: When Ctrl+Shift+P is pressed, this callback pauses the download.
+    It prints a message indicating that the program is paused and prompts the user with
+    a blocking input ("Type Y to resume or N to remain paused:").
+    """
+    global PAUSE_FLAG
+    if not PAUSE_FLAG:
+        PAUSE_FLAG = True
+        print("\n=== The program is now PAUSED ===")
+        while True:
+            decision = input("Type Y to resume or N to remain paused: ").strip().lower()
+            if decision == "y":
+                PAUSE_FLAG = False
+                print("Resuming download...\n")
+                break
+            elif decision == "n":
+                print("Download remains paused. Type Y when ready to resume.")
+            else:
+                print("Invalid input. Please type Y to resume or N to remain paused.")
+
+
+def progress_hook(d):
+    """
+    Displays live download progress with percentage, speed, ETA, and elapsed time.
+    Checks for the pause hotkey (Ctrl+Shift+P). When PAUSE_FLAG is True, progress updates wait.
+    """
+    global PAUSE_FLAG
+    while PAUSE_FLAG:
+        time.sleep(0.2)
+    if d['status'] == 'downloading':
+        downloaded = d.get("downloaded_bytes") or 0
+        total_bytes = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+        speed = d.get("speed") or 0
+        eta = d.get("eta", 0)
+        elapsed = d.get("elapsed", 0)
+        if total_bytes:
+            percent = downloaded / total_bytes * 100
+            speed_kb = speed / 1024 if speed > 0 else 0
+            eta_str = f"ETA: {format_time(eta)}" if eta else ""
+            elapsed_str = f"Elapsed: {format_time(elapsed)}" if elapsed else ""
+            sys.stdout.write(f"\rDownloading: {percent:.2f}% at {speed_kb:.2f} KB/s, {eta_str}, {elapsed_str}")
+            sys.stdout.flush()
+    elif d['status'] == 'finished':
+        sys.stdout.write("\nDownload completed.\n")
+
+
+def print_file_details(video_url):
+    """
+    Performs a quiet extraction for the given video URL to fetch its title, best format,
+    quality (height), and estimated file size.
+    Returns a tuple: (title, file extension, quality, filesize string).
+    """
+    details = {"title": "Unknown", "ext": "unknown", "height": "N/A", "filesize": None}
+    try:
+        with YoutubeDL({'quiet': True, 'skip_download': True, 'socket_timeout': 60}) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+            details["title"] = info.get("title", "Unknown")
+            best_fmt = None
+            best_height = 0
+            for fmt in info.get("formats", []):
+                height = fmt.get("height")
+                if height is not None and height <= 1080 and height > best_height:
+                    best_fmt = fmt
+                    best_height = height
+            if best_fmt:
+                details["ext"] = best_fmt.get("ext", "unknown")
+                details["height"] = best_fmt.get("height", "N/A")
+                filesize = best_fmt.get("filesize") or best_fmt.get("filesize_approx")
+                details["filesize"] = filesize
+    except Exception as e:
+        print(f"Error fetching file details: {e}")
+    filesize_str = (f"{details['filesize'] / (1024 * 1024):.2f} MB" if details["filesize"] else "N/A")
+    return (details["title"], details["ext"], details["height"], filesize_str)
+
+
+def convert_sub_to_pdf(sub_file, pdf_file):
+    """
+    Converts a subtitle (VTT) file to a PDF using FPDF.
+    Each line is encoded to Latin-1 (with 'replace' for errors) to avoid codec issues.
+    """
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", size=12)
+    try:
+        with open(sub_file, "r", encoding="utf-8") as f:
+            for line in f:
+                safe_line = line.encode("latin-1", "replace").decode("latin-1")
+                pdf.multi_cell(0, 10, safe_line)
+        pdf.output(pdf_file)
+        print(f"Transcript converted to PDF: {pdf_file}")
+    except Exception as e:
+        print(f"Error converting transcript to PDF: {e}")
+
+
+def convert_sub_to_docx(sub_file, docx_file):
+    """
+    Converts a subtitle (VTT) file to a DOCX file using python-docx.
+    Each line from the subtitle file is added as a paragraph.
+    """
+    try:
+        document = Document()
+        with open(sub_file, "r", encoding="utf-8") as f:
+            for line in f:
+                document.add_paragraph(line.strip())
+        document.save(docx_file)
+        print(f"Transcript converted to DOCX: {docx_file}")
+    except Exception as e:
+        print(f"Error converting transcript to DOCX: {e}")
+
+
+def choose_download_folder():
+    """Opens a folder selection dialog and returns the selected folder path."""
+    root = tk.Tk()
+    root.withdraw()  # Hide the main window
+    folder = filedialog.askdirectory(title="Choose folder to save downloaded videos")
+    if not folder:
+        print("No folder selected. Exiting.")
+        sys.exit(1)
+    return folder
+
+
+def get_single_video(url):
+    """
+    Given a single video URL, extracts the video information (ID and title)
+    and returns a list with one tuple: (serial number, video ID, title).
+    """
+    try:
+        with YoutubeDL({'quiet': True, 'skip_download': True, 'socket_timeout': 60}) as ydl:
+            info = ydl.extract_info(url, download=False)
+            video_id = info.get("id")
+            title = info.get("title", "No Title")
+            return [(1, video_id, title)]
+    except Exception as e:
+        print(f"Error fetching video information: {e}")
+        sys.exit(1)
+
+
+def display_and_choose_videos(playlist_url, mode):
+    """
+    If mode is 'playlist', uses flat extraction to list videos (ID and title)
+    from the playlist and lets the user select ALL or a subset.
+    Returns a list of tuples: (serial number, video ID, title).
+    If mode is 'single', processes a single video URL and returns a list with one tuple.
+    """
+    if mode == "single":
+        return get_single_video(playlist_url)
+    else:
+        fixed_url = fix_playlist_url(playlist_url)
+        flat_opts = {
+            'quiet': True,
+            'skip_download': True,
+            'extract_flat': True,
+            'playlist_retries': 5,
+            'socket_timeout': 30,
+            'ignoreerrors': True,
+        }
+        with YoutubeDL(flat_opts) as ydl:
+            print("Extracting flat playlist information...")
+            flat_info = ydl.extract_info(fixed_url, download=False)
+            entries = flat_info.get("entries", [])
+        if not entries:
+            print("No videos found in the provided playlist!")
+            sys.exit(1)
+        video_list = []
+        print(f"\nFound {len(entries)} videos:\n")
+        for index, entry in enumerate(entries, start=1):
+            title = entry.get("title", "No Title")
+            vid = entry.get("id")
+            video_list.append((index, vid, title))
+            print(f"{index}. {title}")
+        while True:
+            print("\nDownload options:")
+            print("  [A] Download ALL videos")
+            print("  [S] Select specific videos (comma separated indices, e.g., 1,3,5)")
+            option = input("Choose download mode (A/S): ").strip().lower()
+            if option == 'a':
+                selected = video_list
+            elif option == 's':
+                indices = input("Enter video indices to download (comma separated): ")
+                try:
+                    sel_indices = [int(x.strip()) for x in indices.split(",") if x.strip().isdigit()]
+                    selected = [video_list[i - 1] for i in sel_indices if 0 < i <= len(video_list)]
+                except Exception as e:
+                    print(f"Error parsing selection: {e}")
+                    continue
+            else:
+                print("Invalid option. Try again.")
+                continue
+            return selected
+
+
+def download_videos(selected_videos, transcript_enabled, transcript_format, download_folder, is_single=False):
+    """
+    Downloads each selected video while displaying its details and timing.
+    Adds a serial number prefix to the filename for playlists unless is_single is True.
+    Uses concurrent fragment downloads for higher speed.
+    Checks for a hotkey (Ctrl+Shift+P) for pausing on the fly.
+    If transcripts are enabled, after download it attempts to convert the VTT file
+    to the chosen format (PDF, DOCX, or both).
+    Returns a list of videos (by serial) that failed to download.
+    """
+    overall_start = time.time()
+    failed_videos = []
+    for serial, video_id, _ in selected_videos:
+        video_url = f"https://www.youtube.com/watch?v={video_id}"
+        f_title, ext, quality, filesize_str = print_file_details(video_url)
+        print(f"\n[Video {serial}/{len(selected_videos)}] {f_title}")
+        print(f"Details: Format: {ext}, Quality: {quality}p, Size: {filesize_str}")
+        print(f"(Overall elapsed time so far: {format_time(time.time() - overall_start)})")
+
+        # Use a different output template if single video (no serial prefix)
+        if is_single:
+            outtmpl = os.path.join(download_folder, "%(title)s.%(ext)s")
+        else:
+            outtmpl = os.path.join(download_folder, f"L{serial} %(title)s.%(ext)s")
+
+        ydl_opts = {
+            'format': 'best[height<=1080]',
+            'progress_hooks': [progress_hook],
+            'outtmpl': outtmpl,
+            'noplaylist': True,
+            'socket_timeout': 60,
+            'retries': 10,
+            'concurrent_fragment_downloads': 5,
+            'http_chunk_size': 10485760,  # 10 MB
+        }
+        if transcript_enabled:
+            ydl_opts.update({
+                'writesubtitles': True,
+                'subtitleslangs': ['en'],
+                'subtitlesformat': 'vtt',
+                'writeautomaticsub': True,
+            })
+
+        print(f"Starting download of '{f_title}' ... (Press Ctrl+Shift+P to pause)")
+        video_start = time.time()
+        try:
+            with YoutubeDL(ydl_opts) as ydl:
+                ydl.download([video_url])
+        except Exception as e:
+            print(f"\nError downloading '{f_title}': {e}")
+            failed_videos.append((serial, video_id, f_title))
+            continue
+
+        video_time = time.time() - video_start
+        print(f"\nTime taken for '{f_title}': {format_time(video_time)}")
+        print(f"Total overall elapsed time: {format_time(time.time() - overall_start)}")
+
+        # Process transcript if enabled:
+        if transcript_enabled:
+            base_filename = os.path.join(download_folder, f"{f_title}")
+            vtt_filename = base_filename + ".en.vtt"  # Expected subtitle file name
+            if transcript_format == "pdf":
+                output_filename = base_filename + " Transcript.pdf"
+                print(f"Converting transcript for '{f_title}' to PDF...")
+                convert_sub_to_pdf(vtt_filename, output_filename)
+            elif transcript_format == "docx":
+                output_filename = base_filename + " Transcript.docx"
+                print(f"Converting transcript for '{f_title}' to DOCX...")
+                convert_sub_to_docx(vtt_filename, output_filename)
+            elif transcript_format == "both":
+                output_filename_pdf = base_filename + " Transcript.pdf"
+                output_filename_docx = base_filename + " Transcript.docx"
+                print(f"Converting transcript for '{f_title}' to PDF...")
+                convert_sub_to_pdf(vtt_filename, output_filename_pdf)
+                print(f"Converting transcript for '{f_title}' to DOCX...")
+                convert_sub_to_docx(vtt_filename, output_filename_docx)
+            else:
+                print("No valid transcript format selected.")
+    return failed_videos
+
+
+def main():
+    # Register the hotkey for pause/resume (Ctrl+Shift+P)
+    keyboard.add_hotkey('ctrl+shift+p', on_pause_hotkey)
+
+    # First, ask whether single video or playlist
+    while True:
+        print("\nSelect download mode:")
+        print("  [A] Single video")
+        print("  [B] Playlist")
+        mode_choice = input("Enter your choice (A/B): ").strip().lower()
+        if mode_choice in ['a', 'b']:
+            break
+        else:
+            print("Invalid selection. Please choose A or B.")
+
+    if mode_choice == 'a':
+        # Single video: Get video URL and extract details
+        video_url = input("Enter the YouTube video URL: ").strip()
+        if not video_url:
+            print("A valid URL is required. Exiting.")
+            sys.exit(1)
+        selected_videos = get_single_video(video_url)
+    else:
+        # Playlist mode
+        playlist_url = input("Enter the YouTube playlist URL: ").strip()
+        if not playlist_url:
+            print("A valid URL is required. Exiting.")
+            sys.exit(1)
+        selected_videos = display_and_choose_videos(playlist_url, mode="playlist")
+        # Ask for confirmation for playlists only:
+        print(f"\nYou have selected {len(selected_videos)} video(s).")
+        confirm_videos = input("Are these choices correct? (Y for yes, N for no): ").strip().lower()
+        if confirm_videos != 'y':
+            print("Restarting download options...\n")
+            main()
+            return
+
+    # Ask user where to save files using a folder selection dialog
+    download_folder = choose_download_folder()
+
+    # Ask for transcript download option
+    transcript_enabled = False
+    transcript_format = None
+    trans_opt = input("Do you want to download transcripts (if available)? (Y for yes, N for no): ").strip().lower()
+    if trans_opt == 'y':
+        transcript_enabled = True
+        print("\nPlease choose transcript format:")
+        print("  [A] PDF only")
+        print("  [B] DOCX only")
+        print("  [C] Both PDF and DOCX")
+        choice = input("Enter your choice (A/B/C): ").strip().lower()
+        if choice == "a":
+            transcript_format = "pdf"
+        elif choice == "b":
+            transcript_format = "docx"
+        elif choice == "c":
+            transcript_format = "both"
+        else:
+            print("Invalid selection. Defaulting to PDF.")
+            transcript_format = "pdf"
+
+    # Show a summary of your selections (both for single video and playlists)
+    print("\nSummary of your selections:")
+    if mode_choice == 'a':
+        print("Download mode: Single video")
+    else:
+        print("Download mode: Playlist")
+    print(f"Number of videos selected: {len(selected_videos)}")
+    if transcript_enabled:
+        print(f"Transcripts will be downloaded in {transcript_format.upper()} format.")
+    else:
+        print("Transcripts will NOT be downloaded.")
+
+    # Prompt for overall confirmation in both single video and playlist modes.
+    overall_confirm = input(
+        "Please confirm your selections above. Do these look correct? (Y for yes, N for no): ").strip().lower()
+    if overall_confirm != 'y':
+        print("Restarting download options...\n")
+        main()
+        return
+
+    # Set is_single flag based on the download mode
+    is_single = (mode_choice == 'a')
+    failed_videos = download_videos(selected_videos, transcript_enabled, transcript_format, download_folder, is_single)
+
+    if failed_videos:
+        print("\nThe following videos failed to download:")
+        for serial, vid, title in failed_videos:
+            print(f"  {title}")
+        ans = input("\nDo you want to re-download/resume the failed videos? (Y for yes, N for no): ").strip().lower()
+        if ans == 'y':
+            failed_videos = download_videos(failed_videos, transcript_enabled, transcript_format, download_folder,
+                                            is_single)
+            if failed_videos:
+                print("\nStill failed:")
+                for serial, vid, title in failed_videos:
+                    print(f"  {title}")
+            else:
+                print("\nAll failed videos have now been downloaded successfully.")
+    else:
+        print("\nAll videos downloaded successfully.")
+
+    print("\nDownload process finished.")
+
+
+if __name__ == '__main__':
+    main()
